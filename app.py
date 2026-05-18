@@ -1,375 +1,248 @@
 import streamlit as st
-import re
 import io
+import re
 from collections import defaultdict
-import pandas as pd
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import mm
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Zones Partagées par Client", layout="wide")
 
-def parse_departments(raw: str) -> list[str]:
-    parts = re.split(r"[,/\-\s]+", raw.strip())
-    return [p.strip() for p in parts if p.strip()]
+st.title("🗺️ Zones Communes — Clients en concurrence")
+st.markdown("Identifie quelles zones sont couvertes par plusieurs clients et lesquels.")
+
+DEFAULT = """\
+AS\tPV\t40,32,64,65
+HA 1\tPV\t89,45,28,41
+HA2\tPV\t71,58,89,21,39,70,25,90
+EB\tPV\t24,46
+RR\tPV\t28,61,53,35,44,49,72,37,86,79,85,36,18,41,28,45
+YT1\tPV\t22,29,56,35
+YT2\tPV\t44,49,85,53,72,79,86
+AI\tPV\t49,35,72,53
+ANL\tPV\t32,65,31,09,11
+VER\tPV\t19,23,87,24
+ZC GLOBAL\tPV\t81,12,37,41,36,18,85,44,26,07,38,70,25,90,15,63,43,03
+ZC1\tPV\t70,25,90
+ZC2\tPV\t85,44
+ZC3\tPV\t36,18,37,41
+ZC4\tPV\t26,07,38
+ZC5\tPV\t15,63,43,03
+ZC6\tPV\t81,12
+SI\tPV\t46,12,81,82
+SH\tPV\t54,55,57,88,51,52
+OR\tPV\t15,12,48,43
+FA\tPV\t38,01,83,04
+EL\tPV\t31,66,09,11,34,30,48
+IG1\tPV\t76,80,72,53,29,22,56,28,45
+IG2\tPV\t55,08
+ET1\tPV\t31,81,82,09,11,66,32
+SIM\tPV\t30,34,84
+AV1\tPV\t67,68,88
+AV2\tPV\t57,54,70,88,90,67,68
+RN\tPV\t24,47,66,11,09,64,65,87,23,19
+DG\tPV\t11,34,31,82,81
+LB\tPV\t85,79
+AR2\tPV\t63,23,03
+AR3\tPV\t53,72
+NF\tPV\t60,80,02,28,45,27,76
+ELIE PV 1\tPV\t29,22,35,56,44
+ELIE PV 2\tPV\t85,79,86,17,16,49
+BL\tPV\t16,17,33,64,65,40,47,32"""
 
 
-def parse_input(text: str) -> list[dict]:
-    rows = []
+def parse_lines(text):
+    results = []
     for line in text.strip().splitlines():
         line = line.strip()
         if not line:
             continue
-        parts = re.split(r"\t+", line)
-        if len(parts) < 3:
-            parts = re.split(r"  +", line)
-        if len(parts) < 3:
-            st.warning(f"Ligne ignorée (format invalide) : `{line}`")
+        if "\t" in line:
+            parts = [p.strip() for p in line.split("\t") if p.strip()]
+        else:
+            parts = re.split(r"\s{2,}", line)
+            parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) < 2:
             continue
-        client = parts[0].strip()
-        typ    = parts[1].strip()
-        depts  = parse_departments(parts[2].strip())
-        if client and depts:
-            rows.append({"client": client, "type": typ, "departments": depts})
-    return rows
+        if len(parts) == 2:
+            client, zones = parts[0], parts[1]
+        else:
+            client = parts[0]
+            zones = " ".join(parts[2:])
+        dept_list = re.findall(r"\d{2}", zones)
+        dept_list = [d.zfill(2) for d in dept_list]
+        results.append((client, dept_list))
+    return results
 
 
-def sort_dept_key(d):
-    return d.zfill(3)
+def compute_zone_map(rows):
+    zone_clients = defaultdict(list)
+    for client, depts in rows:
+        for dept in depts:
+            if client not in zone_clients[dept]:
+                zone_clients[dept].append(client)
+    return zone_clients
 
 
-def build_dept_table(rows):
-    dept_map = defaultdict(list)
-    for row in rows:
-        for d in row["departments"]:
-            dept_map[d].append(row["client"])
-    return dict(sorted(dept_map.items(), key=lambda x: sort_dept_key(x[0])))
-
-
-def build_zone_groups(rows):
-    """Group clients that share the exact same set of departments."""
-    map_ = {}
-    for row in rows:
-        sorted_depts = sorted(row["departments"], key=sort_dept_key)
-        key = "-".join(sorted_depts)
-        label = ", ".join(sorted_depts)
-        if key not in map_:
-            map_[key] = {"zone_label": label, "depts": sorted_depts, "clients": [], "nb_depts": len(sorted_depts)}
-        map_[key]["clients"].append(row["client"])
-    result = sorted(map_.values(), key=lambda x: -len(x["clients"]))
-    for g in result:
-        g["nb_clients"] = len(g["clients"])
-    return result
-
-
-# ── PDF generation ────────────────────────────────────────────────────────────
-
-HDR_BG   = colors.HexColor("#1a3c5e")
-HDR_FG   = colors.white
-ROW_ALT  = colors.HexColor("#eaf2fb")
-ROW_EVEN = colors.white
-GRID     = colors.HexColor("#b0c4de")
-
-
-def make_table(data, col_widths, col_headers, cell_style):
-    hdr_para_style = ParagraphStyle(
-        "hdr", parent=cell_style, textColor=HDR_FG, alignment=TA_CENTER
-    )
-    header_row = [Paragraph(f"<b>{h}</b>", hdr_para_style) for h in col_headers]
-    table_data = [header_row]
-    for r in data:
-        table_data.append([Paragraph(str(c), cell_style) for c in r])
-
-    t = Table(table_data, colWidths=col_widths, repeatRows=1)
-    row_bg = []
-    for i in range(1, len(table_data)):
-        bg = ROW_ALT if i % 2 == 0 else ROW_EVEN
-        row_bg.append(("BACKGROUND", (0, i), (-1, i), bg))
-
-    t.setStyle(TableStyle([
-        ("BACKGROUND",  (0, 0), (-1, 0), HDR_BG),
-        ("TEXTCOLOR",   (0, 0), (-1, 0), HDR_FG),
-        ("FONTNAME",    (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",    (0, 0), (-1, 0), 9),
-        ("ALIGN",       (0, 0), (-1, 0), "CENTER"),
-        ("VALIGN",      (0, 0), (-1, -1), "TOP"),
-        ("GRID",        (0, 0), (-1, -1), 0.4, GRID),
-        ("LEFTPADDING",  (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING",   (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
-        *row_bg,
-    ]))
-    return t
-
-
-def generate_pdf(rows: list[dict]) -> bytes:
-    buf = io.BytesIO()
+def build_pdf(zone_clients, titre):
+    buffer = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf,
+        buffer,
         pagesize=landscape(A4),
-        rightMargin=1.5*cm, leftMargin=1.5*cm,
-        topMargin=1.5*cm,   bottomMargin=1.5*cm,
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
     )
 
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "title", parent=styles["Title"],
-        fontSize=16, spaceAfter=12, alignment=TA_CENTER
-    )
-    sub_style = ParagraphStyle(
-        "sub", parent=styles["Heading2"],
-        fontSize=12, spaceBefore=16, spaceAfter=6
-    )
-    cell_style = ParagraphStyle(
-        "cell", parent=styles["Normal"],
-        fontSize=8, leading=11
-    )
-    cell_center = ParagraphStyle(
-        "cellc", parent=cell_style, alignment=TA_CENTER
-    )
+    title_style = ParagraphStyle("T", parent=styles["Title"], fontSize=14,
+                                  textColor=colors.HexColor("#1a3a5c"), spaceAfter=4,
+                                  fontName="Helvetica-Bold")
+    subtitle_style = ParagraphStyle("S", parent=styles["Normal"], fontSize=8,
+                                     textColor=colors.HexColor("#555555"), spaceAfter=10)
+    header_style = ParagraphStyle("H", parent=styles["Normal"], fontSize=9,
+                                   fontName="Helvetica-Bold", textColor=colors.white, leading=12)
+    cell_style = ParagraphStyle("C", parent=styles["Normal"], fontSize=8, leading=11)
+    cell_center = ParagraphStyle("CC", parent=cell_style, alignment=1)
 
-    W = landscape(A4)[0] - 3*cm
-    story = []
+    sorted_zones = sorted(zone_clients.keys())
 
-    story.append(Paragraph("Rapport – Groupes de Zones Départementales", title_style))
-    story.append(Spacer(1, 0.3*cm))
+    header = [
+        Paragraph("DÉPARTEMENT", header_style),
+        Paragraph("NB CLIENTS", header_style),
+        Paragraph("CLIENTS PRÉSENTS SUR CETTE ZONE", header_style),
+    ]
+    table_data = [header]
 
-    # ── Table 1 : Zone groups ─────────────────────────────────────────────────
-    story.append(Paragraph("1. Groupes de Zones (clients avec les mêmes départements)", sub_style))
-
-    zone_groups = build_zone_groups(rows)
-    zone_data = []
-    for g in zone_groups:
-        zone_data.append([
-            str(g["nb_clients"]),
-            str(g["nb_depts"]),
-            g["zone_label"],
-            ", ".join(sorted(g["clients"])),
+    for dept in sorted_zones:
+        clients = zone_clients[dept]
+        nb = len(clients)
+        table_data.append([
+            Paragraph(f"<b>{dept}</b>", cell_center),
+            Paragraph(f"<b>{nb}</b>", cell_center),
+            Paragraph(" • ".join(clients), cell_style),
         ])
 
-    t1 = make_table(
-        zone_data,
-        col_widths=[W*0.07, W*0.07, W*0.52, W*0.34],
-        col_headers=["Nb clients", "Nb depts", "Départements (zone)", "Clients"],
-        cell_style=cell_style,
-    )
-    story.append(t1)
-    story.append(Spacer(1, 0.5*cm))
+    col_widths = [30 * mm, 28 * mm, 215 * mm]
+    table = Table(table_data, colWidths=col_widths, repeatRows=1)
 
-    # ── Table 2 : clients + their departments ─────────────────────────────────
-    story.append(Paragraph("2. Récapitulatif par Client", sub_style))
+    row_styles = []
+    for i, dept in enumerate(sorted_zones, start=1):
+        nb = len(zone_clients[dept])
+        if nb >= 5:
+            bg = colors.HexColor("#f8d7da")
+        elif nb >= 3:
+            bg = colors.HexColor("#fff3cd")
+        elif nb >= 2:
+            bg = colors.HexColor("#d4edda")
+        else:
+            bg = colors.white if i % 2 == 0 else colors.HexColor("#f8f9fa")
+        row_styles.append(("BACKGROUND", (0, i), (-1, i), bg))
 
-    client_data = []
-    for row in rows:
-        depts_sorted = sorted(row["departments"], key=sort_dept_key)
-        client_data.append([
-            row["client"],
-            row["type"],
-            str(len(depts_sorted)),
-            ", ".join(depts_sorted),
-        ])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a3a5c")),
+        ("ALIGN", (0, 0), (1, -1), "CENTER"),
+        ("ALIGN", (2, 0), (2, -1), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, 0), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("TOPPADDING", (0, 1), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#b0c4de")),
+        ("LINEBELOW", (0, 0), (-1, 0), 1.5, colors.HexColor("#1a3a5c")),
+    ] + row_styles))
 
-    t2 = make_table(
-        client_data,
-        col_widths=[W*0.20, W*0.07, W*0.07, W*0.66],
-        col_headers=["Client", "Type", "Nb depts", "Départements"],
-        cell_style=cell_style,
-    )
-    story.append(t2)
-    story.append(Spacer(1, 0.5*cm))
-
-    # ── Table 3 : department → clients ────────────────────────────────────────
-    story.append(Paragraph("3. Récapitulatif par Département", sub_style))
-
-    dept_map = build_dept_table(rows)
-    dept_data = []
-    for dept, clients in dept_map.items():
-        unique_clients = sorted(set(clients))
-        dept_data.append([dept, str(len(unique_clients)), ", ".join(unique_clients)])
-
-    t3 = make_table(
-        dept_data,
-        col_widths=[W*0.10, W*0.10, W*0.80],
-        col_headers=["Département", "Nb clients", "Clients"],
-        cell_style=cell_style,
-    )
-    story.append(t3)
-
+    legend_style = ParagraphStyle("L", parent=styles["Normal"], fontSize=8,
+                                   textColor=colors.HexColor("#555555"), spaceBefore=8)
+    story = [
+        Paragraph(titre, title_style),
+        Paragraph("Nombre de clients présents par département — code couleur selon le niveau de concurrence", subtitle_style),
+        table,
+        Spacer(1, 6),
+        Paragraph(
+            "Rouge : 5 clients ou plus  |  Jaune : 3 ou 4 clients  |  Vert : 2 clients  |  Blanc/gris : 1 client",
+            legend_style
+        ),
+    ]
     doc.build(story)
-    return buf.getvalue()
+    buffer.seek(0)
+    return buffer.read()
 
 
-# ── Streamlit UI ──────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
+raw_text = st.text_area("✏️ Données clients", value=DEFAULT, height=350)
+titre_pdf = st.text_input("Titre du PDF", value="Zones Communes — Clients en concurrence (Campagnes PV)")
 
-st.set_page_config(page_title="Clients & Zones", layout="wide", page_icon="🗺️")
+rows = parse_lines(raw_text)
 
-st.title("🗺️ Gestionnaire Clients / Zones Départementales")
-st.markdown(
-    "Collez vos données au format **`CLIENT [tab] TYPE [tab] DÉPARTEMENTS`**  \n"
-    "Séparateurs de départements acceptés : `,` `/` `-` ou espaces."
-)
+if rows:
+    zone_clients = compute_zone_map(rows)
+    sorted_zones = sorted(zone_clients.keys())
 
-raw = st.text_area(
-    "📥 Données clients",
-    height=280,
-    placeholder="HA2\tPV\t89,45,28,41\nEB\tPV\t71,58,89,21,39,70,25,90\n..."
-)
+    st.markdown(f"**{len(rows)} clients · {len(sorted_zones)} départements couverts**")
 
-col_btn1, col_btn2 = st.columns([1, 5])
-with col_btn1:
-    run = st.button("🔍 Analyser", type="primary", use_container_width=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        min_clients = st.slider("Afficher les zones avec au moins X clients", 1, 10, 1)
+    with col2:
+        search_client = st.text_input("🔍 Filtrer par client", "")
 
-if run:
-    if not raw.strip():
-        st.error("Veuillez coller des données avant d'analyser.")
-        st.stop()
+    filtered = {
+        dept: clients
+        for dept, clients in zone_clients.items()
+        if len(clients) >= min_clients
+        and (not search_client or any(search_client.upper() in c.upper() for c in clients))
+    }
 
-    rows = parse_input(raw)
+    import pandas as pd
+    df = pd.DataFrame([
+        {"Département": dept, "Nb clients": len(clients), "Clients": " • ".join(clients)}
+        for dept, clients in sorted(filtered.items())
+    ])
 
-    if not rows:
-        st.error("Aucune donnée valide trouvée. Vérifiez le format.")
-        st.stop()
+    def color_rows(row):
+        nb = row["Nb clients"]
+        if nb >= 5:
+            return ["background-color: #f8d7da"] * len(row)
+        elif nb >= 3:
+            return ["background-color: #fff3cd"] * len(row)
+        elif nb >= 2:
+            return ["background-color: #d4edda"] * len(row)
+        return [""] * len(row)
 
-    dept_map    = build_dept_table(rows)
-    zone_groups = build_zone_groups(rows)
-
-    # ── Metrics ────────────────────────────────────────────────────────────────
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("👤 Clients", len(rows))
-    m2.metric("🗺️ Départements uniques", len(dept_map))
-    m3.metric("📌 Affectations totales", sum(len(r["departments"]) for r in rows))
-    m4.metric("🔗 Groupes de zones", len(zone_groups))
-
-    st.divider()
-
-    # ── Tabs ───────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3 = st.tabs(["🔗 Groupes de Zones", "👤 Par Client", "📍 Par Département"])
-
-    # ── TAB 1 : ZONE GROUPS ────────────────────────────────────────────────────
-    with tab1:
-        st.subheader("Groupes de zones — clients partageant les mêmes départements")
-        st.caption("Trié par nombre de clients décroissant. Chaque ligne = un groupe unique de départements.")
-
-        search_zone = st.text_input("🔎 Filtrer par département ou client", key="sz")
-
-        zone_rows = []
-        for g in zone_groups:
-            clients_str = ", ".join(sorted(g["clients"]))
-            if search_zone:
-                s = search_zone.lower()
-                if s not in g["zone_label"].lower() and s not in clients_str.lower():
-                    continue
-            zone_rows.append({
-                "Nb clients": g["nb_clients"],
-                "Nb depts": g["nb_depts"],
-                "Départements (zone)": g["zone_label"],
-                "Clients": clients_str,
-            })
-
-        if zone_rows:
-            df_zones = pd.DataFrame(zone_rows)
-            st.dataframe(
-                df_zones,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Nb clients": st.column_config.NumberColumn(width="small"),
-                    "Nb depts":   st.column_config.NumberColumn(width="small"),
-                    "Départements (zone)": st.column_config.TextColumn(width="large"),
-                    "Clients": st.column_config.TextColumn(width="large"),
-                }
-            )
-        else:
-            st.info("Aucun groupe trouvé pour ce filtre.")
-
-        st.divider()
-        st.subheader("Détail par groupe")
-        for g in zone_groups:
-            clients_str = ", ".join(sorted(g["clients"]))
-            if search_zone:
-                s = search_zone.lower()
-                if s not in g["zone_label"].lower() and s not in clients_str.lower():
-                    continue
-            label = f"**{g['nb_clients']} client(s)** — `{g['zone_label']}` ({g['nb_depts']} depts)"
-            with st.expander(label):
-                for c in sorted(g["clients"]):
-                    st.markdown(f"• {c}")
-
-    # ── TAB 2 : PAR CLIENT ─────────────────────────────────────────────────────
-    with tab2:
-        st.subheader("Récapitulatif par Client")
-        search_client = st.text_input("🔎 Filtrer par client ou département", key="sc")
-
-        client_rows = []
-        for row in rows:
-            depts_sorted = sorted(row["departments"], key=sort_dept_key)
-            depts_str = ", ".join(depts_sorted)
-            if search_client:
-                s = search_client.lower()
-                if s not in row["client"].lower() and s not in depts_str.lower():
-                    continue
-            client_rows.append({
-                "Client": row["client"],
-                "Type": row["type"],
-                "Nb depts": len(depts_sorted),
-                "Départements": depts_str,
-            })
-
-        if client_rows:
-            df_clients = pd.DataFrame(client_rows)
-            st.dataframe(df_clients, use_container_width=True, hide_index=True,
-                column_config={
-                    "Nb depts": st.column_config.NumberColumn(width="small"),
-                    "Départements": st.column_config.TextColumn(width="large"),
-                })
-        else:
-            st.info("Aucun client trouvé pour ce filtre.")
-
-    # ── TAB 3 : PAR DÉPARTEMENT ────────────────────────────────────────────────
-    with tab3:
-        st.subheader("Récapitulatif par Département")
-        search_dept = st.text_input("🔎 Filtrer par département ou client", key="sd")
-
-        dept_rows = []
-        for dept, clients in dept_map.items():
-            unique = sorted(set(clients))
-            clients_str = ", ".join(unique)
-            if search_dept:
-                s = search_dept.lower()
-                if s not in dept.lower() and s not in clients_str.lower():
-                    continue
-            dept_rows.append({
-                "Département": dept,
-                "Nb clients": len(unique),
-                "Clients": clients_str,
-            })
-
-        if dept_rows:
-            df_depts = pd.DataFrame(dept_rows)
-            st.dataframe(df_depts, use_container_width=True, hide_index=True,
-                column_config={
-                    "Département": st.column_config.TextColumn(width="small"),
-                    "Nb clients": st.column_config.NumberColumn(width="small"),
-                    "Clients": st.column_config.TextColumn(width="large"),
-                })
-        else:
-            st.info("Aucun département trouvé pour ce filtre.")
-
-    st.divider()
-
-    # ── PDF Export ─────────────────────────────────────────────────────────────
-    with st.spinner("Génération du PDF…"):
-        pdf_bytes = generate_pdf(rows)
-
-    st.download_button(
-        label="📄 Télécharger le rapport PDF",
-        data=pdf_bytes,
-        file_name="rapport_clients_zones.pdf",
-        mime="application/pdf",
-        type="primary",
+    st.dataframe(
+        df.style.apply(color_rows, axis=1),
+        use_container_width=True,
+        hide_index=True,
+        height=420,
     )
-    st.success("✅ Analyse terminée — PDF prêt à télécharger !")
+
+    st.markdown("🔴 5+ clients &nbsp;|&nbsp; 🟡 3-4 clients &nbsp;|&nbsp; 🟢 2 clients &nbsp;|&nbsp; ⬜ 1 client", unsafe_allow_html=True)
+
+    st.divider()
+    c1, c2, c3, c4 = st.columns(4)
+    all_counts = [len(v) for v in zone_clients.values()]
+    c1.metric("Depts couverts", len(zone_clients))
+    c2.metric("1 seul client", sum(1 for x in all_counts if x == 1))
+    c3.metric("2 à 4 clients", sum(1 for x in all_counts if 2 <= x <= 4))
+    c4.metric("5+ clients", sum(1 for x in all_counts if x >= 5))
+
+    st.divider()
+    if st.button("🖨️ Générer le PDF (toutes les zones)", type="primary", use_container_width=True):
+        with st.spinner("Génération…"):
+            pdf_bytes = build_pdf(zone_clients, titre_pdf)
+        st.success(f"✅ PDF généré — {len(zone_clients)} départements")
+        st.download_button(
+            label="⬇️ Télécharger le PDF",
+            data=pdf_bytes,
+            file_name="zones_concurrence.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+else:
+    st.warning("Aucune donnée valide détectée.")
